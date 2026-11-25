@@ -633,8 +633,6 @@ async def close_ticket(guild, channel, ticket, closer):
     try:
         await channel.delete(reason=f"Closed by {closer}")
     except discord.HTTPException:
-# ─────────────────────────── bot ───────────────────────────
-
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=commands.when_mentioned_or(PREFIX), intents=discord.Intents.all(),

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: venice-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PREFIX
+        value: "!"
+      - key: TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: WEB_URL
+        sync: false
+      - key: REDIRECT_URI
+        sync: false

@@ -27,7 +27,7 @@ REDIRECT_URI = os.getenv("REDIRECT_URI", "")
 WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DB_PATH = os.getenv("DB_PATH", "data/bot.db")
-PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
+PORT = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
 API = "https://discord.com/api/v10"
 
 DEFAULT, SUCCESS, ERROR, WARN, INFO, NEUTRAL = 0x5865F2, 0x57F287, 0xED4245, 0xFEE75C, 0x5865F2, 0x2B2D31
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS guilds (
     min_account_age INTEGER DEFAULT 0, automod_enabled INTEGER DEFAULT 1, automod_escalation INTEGER DEFAULT 3
 );
 CREATE TABLE IF NOT EXISTS blocked_words (guild_id INTEGER, word TEXT, PRIMARY KEY (guild_id, word));
+CREATE TABLE IF NOT EXISTS ignored_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id));
 CREATE TABLE IF NOT EXISTS warnings (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, user_id INTEGER,
     mod_id INTEGER, reason TEXT, created_at TEXT
@@ -93,23 +94,39 @@ MIGRATIONS = {
 }
 
 
+async def _raw(sql):
+    c = await _conn.execute(sql)
+    return await c.fetchall()
+
+
 async def db_init():
-    global _conn
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    global _conn, DB_PATH
+    try:
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+        probe = os.path.join(os.path.dirname(DB_PATH) or ".", ".probe")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+    except OSError as e:
+        log.warning("DB path %s unusable (%s) — falling back to data/bot.db", DB_PATH, e)
+        DB_PATH = "data/bot.db"
+        os.makedirs("data", exist_ok=True)
     _conn = await aiosqlite.connect(DB_PATH)
     _conn.row_factory = aiosqlite.Row
     await _conn.executescript(SCHEMA)
     for table, cols in MIGRATIONS.items():
-        existing = {r["name"] for r in await _fetchall_raw(f"PRAGMA table_info({table})")}
+        existing = {r["name"] for r in await _raw(f"PRAGMA table_info({table})")}
         for col, decl in cols.items():
             if col not in existing:
                 await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     await _conn.commit()
+    log.info("Database ready at %s", DB_PATH)
 
 
-async def _fetchall_raw(sql):
-    c = await _conn.execute(sql)
-    return await c.fetchall()
+async def db_close():
+    if _conn:
+        await _conn.close()
+        log.info("Database closed")
 
 
 async def ex(sql, p=()):
@@ -176,20 +193,100 @@ def link_ok() -> bool:
     return WEB_URL.startswith("http")
 
 
+def can_act(guild: discord.Guild, actor: discord.Member, target: discord.Member) -> str | None:
+    if target.id == actor.id:
+        return "You can't target yourself."
+    if target.id == guild.owner_id:
+        return "That member is the server owner."
+    if actor.id != guild.owner_id and target.top_role >= actor.top_role:
+        return "That member's top role is equal to or above yours."
+    if guild.me.top_role <= target.top_role:
+        return "My role is below theirs — drag my role higher."
+    return None
+
+
+def fmt_dur(secs: int) -> str:
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+# ─────────────────────────── shared actions ───────────────────────────
+
+async def act_ban(guild, mod, member, reason, days=0):
+    try:
+        await member.send(embed=wrn(f"You were banned from **{guild.name}**.\n**Reason:** {reason}", "🔨 Banned"))
+    except discord.HTTPException:
+        pass
+    await guild.ban(member, reason=f"{mod} — {reason}", delete_message_days=days)
+    e = with_user(err(f"{member.mention} banned.\n**Reason:** {reason}\n**Moderator:** {mod.mention}", "🔨 Member Banned"), member)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
+async def act_kick(guild, mod, member, reason):
+    try:
+        await member.send(embed=wrn(f"You were kicked from **{guild.name}**.\n**Reason:** {reason}", "👢 Kicked"))
+    except discord.HTTPException:
+        pass
+    await member.kick(reason=f"{mod} — {reason}")
+    e = with_user(err(f"{member.mention} kicked.\n**Reason:** {reason}\n**Moderator:** {mod.mention}", "👢 Member Kicked"), member)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
+async def act_softban(guild, mod, member, reason):
+    await guild.ban(member, reason=f"Softban — {mod} — {reason}", delete_message_days=7)
+    await guild.unban(member, reason="Softban release")
+    e = with_user(err(f"{member.mention} softbanned.\n**Reason:** {reason}\n**Moderator:** {mod.mention}", "🧹 Softbanned"), member)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
+async def act_timeout(guild, mod, member, minutes, reason):
+    until = discord.utils.utcnow() + timedelta(minutes=minutes)
+    await member.timeout(until, reason=f"{mod} — {reason}")
+    e = with_user(wrn(f"{member.mention} muted **{minutes}m**.\n**Ends:** <t:{int(until.timestamp())}:R>\n"
+                      f"**Reason:** {reason}\n**Moderator:** {mod.mention}", "🔇 Timed Out"), member)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
+async def act_warn(guild, mod, member, reason):
+    await ex("INSERT INTO warnings (guild_id,user_id,mod_id,reason,created_at) VALUES (?,?,?,?,?)",
+             (guild.id, member.id, mod.id, reason, discord.utils.utcnow().isoformat()))
+    n = (await one("SELECT COUNT(*) c FROM warnings WHERE guild_id=? AND user_id=?", (guild.id, member.id)))["c"]
+    try:
+        await member.send(embed=wrn(f"You were warned in **{guild.name}**.\n**Reason:** {reason}\n**Total warnings:** {n}", "⚠️ Warning"))
+    except discord.HTTPException:
+        pass
+    e = with_user(wrn(f"{member.mention} warned (`#{n}`).\n**Reason:** {reason}\n**Moderator:** {mod.mention}", "⚠️ Warned"), member)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
+async def act_unban(guild, mod, user, reason):
+    await guild.unban(user, reason=f"{mod} — {reason}")
+    e = with_user(ok(f"{user.mention} unbanned.\n**Reason:** {reason}\n**Moderator:** {mod.mention}", "🔓 Unbanned"), user)
+    await log_to(guild, "mod_log", e)
+    return e
+
+
 # ─────────────────────────── views ───────────────────────────
 
 class VerifyView(discord.ui.View):
     def __init__(self, gid: int):
         super().__init__(timeout=None)
         if link_ok():
-            self.add_item(discord.ui.Button(label="Verify", emoji="🔐", style=discord.ButtonStyle.link, url=f"{WEB_URL}/verify?g={gid}"))
+            self.add_item(discord.ui.Button(label="Verify", emoji="🔐", style=discord.ButtonStyle.link,
+                                            url=f"{WEB_URL}/verify?g={gid}"))
 
 
 class WelcomeView(discord.ui.View):
     def __init__(self, gid: int, rules: str | None = None):
         super().__init__(timeout=None)
         if link_ok():
-            self.add_item(discord.ui.Button(label="Verify", emoji="🔐", style=discord.ButtonStyle.link, url=f"{WEB_URL}/verify?g={gid}"))
+            self.add_item(discord.ui.Button(label="Verify", emoji="🔐", style=discord.ButtonStyle.link,
+                                            url=f"{WEB_URL}/verify?g={gid}"))
         if rules and rules.startswith("http"):
             self.add_item(discord.ui.Button(label="Rules", emoji="📜", style=discord.ButtonStyle.link, url=rules))
 
@@ -205,21 +302,21 @@ class StaffPanelView(discord.ui.View):
 
     @discord.ui.button(label="Sign In", emoji="🟢", style=discord.ButtonStyle.success, custom_id="duty:in")
     async def sign_in(self, it: discord.Interaction, b: discord.ui.Button):
-        good, msg, emb = await staff_signin(it.guild, it.user)
+        good, _, emb = await staff_signin(it.guild, it.user)
         await it.response.send_message(embed=emb, ephemeral=not good)
 
     @discord.ui.button(label="Sign Out", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="duty:out")
     async def sign_out(self, it: discord.Interaction, b: discord.ui.Button):
-        good, msg, emb = await staff_signout(it.guild, it.user, "panel")
+        good, _, emb = await staff_signout(it.guild, it.user, "panel")
         await it.response.send_message(embed=emb, ephemeral=not good)
 
     @discord.ui.button(label="My Stats", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="duty:stats")
     async def stats(self, it: discord.Interaction, b: discord.ui.Button):
         r = await ensure_staff(self.gid, it.user.id)
-        h, m = r["total_seconds"] // 3600, (r["total_seconds"] % 3600) // 60
         e = with_user(pnl("📊 Your Activity",
-            f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n"
-            f"**Total duty time:** `{h}h {m}m`\n**On duty:** {'🟢 Yes' if r['on_duty'] else '🔴 No'}"), it.user)
+                          f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n"
+                          f"**Total duty time:** `{fmt_dur(r['total_seconds'])}`\n"
+                          f"**On duty:** {'🟢 Yes' if r['on_duty'] else '🔴 No'}"), it.user)
         await it.response.send_message(embed=e, ephemeral=True)
 
 
@@ -228,8 +325,11 @@ class StaffPanelView(discord.ui.View):
 async def award_points(guild: discord.Guild, member: discord.Member, amount: int, reason: str):
     r = await ensure_staff(guild.id, member.id)
     new = max(0, r["points"] + amount)
+    if new == r["points"] and amount != 0:
+        return
     await ex("UPDATE staff SET points=? WHERE guild_id=? AND user_id=?", (new, guild.id, member.id))
-    e = with_user(pnl("⭐ Points", f"{member.mention} **{'+' if amount > 0 else ''}{amount}** — {reason}\n**Total:** `{new}`", SUCCESS if amount > 0 else ERROR), member)
+    e = with_user(pnl("⭐ Points", f"{member.mention} **{'+' if amount > 0 else ''}{amount}** — {reason}\n**Total:** `{new}`",
+                      SUCCESS if amount > 0 else ERROR), member)
     await log_to(guild, "log_channel", e)
     if amount > 0:
         await promote_check(guild, member)
@@ -238,17 +338,19 @@ async def award_points(guild: discord.Guild, member: discord.Member, amount: int
 async def promote_check(guild: discord.Guild, member: discord.Member):
     r = await ensure_staff(guild.id, member.id)
     ranks = await all_("SELECT * FROM staff_ranks WHERE guild_id=? ORDER BY threshold ASC", (guild.id,))
-    current = [x for x in ranks if x["threshold"] <= r["points"]]
-    if not current:
+    eligible = [x for x in ranks if x["threshold"] <= r["points"]]
+    if not eligible:
         return
-    target = current[-1]
+    target = eligible[-1]
     role = guild.get_role(target["role_id"])
-    if role and role not in member.roles:
-        try:
-            await member.add_roles(role, reason=f"Promotion — {r['points']} points")
-        except discord.HTTPException:
-            return
-        await log_to(guild, "log_channel", with_user(pnl("📈 Promotion", f"{member.mention} promoted to **{target['name']}** (`{r['points']}` points).", SUCCESS), member))
+    if not role or role in member.roles:
+        return
+    try:
+        await member.add_roles(role, reason=f"Automatic promotion — {r['points']} points")
+    except discord.HTTPException:
+        return
+    await log_to(guild, "log_channel", with_user(
+        pnl("📈 Promotion", f"{member.mention} promoted to **{target['name']}** at `{r['points']}` points.", SUCCESS), member))
 
 
 async def staff_signin(guild: discord.Guild, member: discord.Member):
@@ -259,9 +361,11 @@ async def staff_signin(guild: discord.Guild, member: discord.Member):
     if r["last_signin"] == now.date().isoformat():
         return False, "done", wrn("You already completed your shift today. Come back tomorrow. 📅")
     days = r["days_present"] + 1
-    await ex("UPDATE staff SET on_duty=1, duty_start=?, last_signin=?, last_message=?, last_active=?, days_present=? WHERE guild_id=? AND user_id=?",
+    await ex("UPDATE staff SET on_duty=1, duty_start=?, last_signin=?, last_message=?, last_active=?, days_present=? "
+             "WHERE guild_id=? AND user_id=?",
              (now.isoformat(), now.date().isoformat(), now.isoformat(), now.isoformat(), days, guild.id, member.id))
-    e = with_user(pnl("🟢 Staff On Duty", f"{member.mention} signed in.\n**Time:** <t:{int(now.timestamp())}:T>\n**Days present:** `{days}`", SUCCESS), member)
+    e = with_user(pnl("🟢 Staff On Duty", f"{member.mention} signed in.\n**Time:** <t:{int(now.timestamp())}:T>\n"
+                      f"**Days present:** `{days}`", SUCCESS), member)
     e.add_field(name="Role", value=member.top_role.mention)
     await log_to(guild, "log_channel", e)
     return True, "ok", e
@@ -274,14 +378,14 @@ async def staff_signout(guild: discord.Guild, member: discord.Member, source: st
     now = discord.utils.utcnow()
     start = datetime.fromisoformat(r["duty_start"])
     secs = max(1, int((now - start).total_seconds()))
-    await ex("UPDATE staff SET on_duty=0, duty_start=NULL, total_seconds=total_seconds+?, active_seconds=0 WHERE guild_id=? AND user_id=?",
-             (secs, guild.id, member.id))
+    await ex("UPDATE staff SET on_duty=0, duty_start=NULL, total_seconds=total_seconds+?, active_seconds=0 "
+             "WHERE guild_id=? AND user_id=?", (secs, guild.id, member.id))
     await ex("INSERT INTO duty (guild_id, user_id, start_ts, end_ts, seconds) VALUES (?,?,?,?,?)",
              (guild.id, member.id, start.isoformat(), now.isoformat(), secs))
-    h, m = secs // 3600, (secs % 3600) // 60
     label = "🔴 Staff Off Duty" if source == "word" else "🔴 Auto Sign-Out"
     note = "" if source == "word" else "\n**Reason:** idle for over an hour"
-    e = with_user(pnl(label, f"{member.mention} signed out.\n**Shift:** `{h}h {m}m`\n**Days present:** `{r['days_present']}`{note}", ERROR), member)
+    e = with_user(pnl(label, f"{member.mention} signed out.\n**Shift:** `{fmt_dur(secs)}`\n"
+                      f"**Days present:** `{r['days_present']}`{note}", ERROR), member)
     await log_to(guild, "log_channel", e)
     return True, "ok", e
 
@@ -291,17 +395,24 @@ async def staff_signout(guild: discord.Guild, member: discord.Member, source: st
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=commands.when_mentioned_or(PREFIX), intents=discord.Intents.all(),
-                         help_command=None, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, replied_user=True))
+                         help_command=None,
+                         allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, replied_user=True))
         self.join_cache: dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
         self.raid_mode: dict[int, float] = {}
-        self.spam: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=6))
+        self.spam: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=8))
 
     async def setup_hook(self):
         await db_init()
         for c in (Moderation, AutoMod, AntiRaid, Welcomer, Verification, Logs, Staff, Core, Prefix):
-            await self.add_cog(c(self))
+            try:
+                await self.add_cog(c(self))
+            except Exception:
+                log.exception("Failed to load %s", c.__name__)
         await self.restore()
-        await self.tree.sync()
+        try:
+            await self.tree.sync()
+        except Exception:
+            log.exception("Command sync failed — continuing")
         self.staff_tick.start()
         log.info("Commands synced")
 
@@ -319,59 +430,68 @@ class Bot(commands.Bot):
         log.info("Ready as %s — %s guilds", self.user, len(self.guilds))
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="the gates 👀"))
 
+    async def close(self):
+        self.staff_tick.cancel()
+        await db_close()
+        await super().close()
+
     async def on_guild_join(self, g: discord.Guild):
         await settings(g.id)
         if g.system_channel and g.system_channel.permissions_for(g.me).send_messages:
-            await g.system_channel.send(embed=pnl("👋 Thanks for adding me!", "Run `/setup` for a checklist and `/help` for all commands."))
+            await g.system_channel.send(embed=pnl("👋 Thanks for adding me!",
+                                                  "Run `/setup` for a checklist and `/help` for all commands."))
 
     async def on_command_error(self, ctx, e):
         if isinstance(e, commands.CommandNotFound):
             return
         if isinstance(e, commands.MissingPermissions):
-            return await ctx.send(embed=err("You need moderator permissions."))
+            return await ctx.send(embed=err("You don't have permission to use that."))
         if isinstance(e, commands.MissingRequiredArgument):
             return await ctx.send(embed=err(f"Missing argument: `{e.param.name}`"))
         if isinstance(e, commands.BadArgument):
             return await ctx.send(embed=err(str(e)))
-        await ctx.send(embed=err(str(e)))
+        if isinstance(e, commands.BotMissingPermissions):
+            return await ctx.send(embed=err("I'm missing permissions for that."))
+        log.exception("prefix command error", exc_info=e)
+        await ctx.send(embed=err(str(e)[:200]))
 
-    # ── 1 minute staff housekeeping ──
     @tasks.loop(minutes=1)
     async def staff_tick(self):
         now = discord.utils.utcnow()
-        for r in await all_("SELECT * FROM staff WHERE on_duty=1"):
-            guild = self.get_guild(r["guild_id"])
-            if not guild:
-                continue
-            member = guild.get_member(r["user_id"])
-            if not member:
-                continue
-            last = datetime.fromisoformat(r["last_message"]) if r["last_message"] else None
-            active = last is not None and (now - last).total_seconds() <= 600
-            if active:
-                acc = r["active_seconds"] + 60
-                await ex("UPDATE staff SET active_seconds=? WHERE guild_id=? AND user_id=?", (acc, guild.id, member.id))
-                if acc >= 3600:
-                    await ex("UPDATE staff SET active_seconds=active_seconds-3600 WHERE guild_id=? AND user_id=?", (guild.id, member.id))
-                    await award_points(guild, member, 5, "1 hour on duty")
-            if last and (now - last).total_seconds() > 3600:
-                await staff_signout(guild, member, "auto")
+        try:
+            for r in await all_("SELECT * FROM staff WHERE on_duty=1"):
+                guild = self.get_guild(r["guild_id"])
+                member = guild.get_member(r["user_id"]) if guild else None
+                if not member:
+                    continue
+                last = datetime.fromisoformat(r["last_message"]) if r["last_message"] else None
+                if last and (now - last).total_seconds() <= 600:
+                    acc = r["active_seconds"] + 60
+                    await ex("UPDATE staff SET active_seconds=? WHERE guild_id=? AND user_id=?",
+                             (acc, guild.id, member.id))
+                    if acc >= 3600:
+                        await ex("UPDATE staff SET active_seconds=active_seconds-3600 WHERE guild_id=? AND user_id=?",
+                                 (guild.id, member.id))
+                        await award_points(guild, member, 5, "1 hour on duty")
+                if last and (now - last).total_seconds() > 3600:
+                    await staff_signout(guild, member, "auto")
 
-        for r in await all_("SELECT * FROM staff"):
-            guild = self.get_guild(r["guild_id"])
-            if not guild:
-                continue
-            member = guild.get_member(r["user_id"])
-            if not member:
-                continue
-            last_active = datetime.fromisoformat(r["last_active"]) if r["last_active"] else None
-            if not last_active or (now - last_active).total_seconds() < 86400:
-                continue
-            last_pen = datetime.fromisoformat(r["last_penalty"]) if r["last_penalty"] else None
-            if last_pen and (now - last_pen).total_seconds() < 86400:
-                continue
-            await ex("UPDATE staff SET last_penalty=? WHERE guild_id=? AND user_id=?", (now.isoformat(), guild.id, member.id))
-            await award_points(guild, member, -20, "24h inactivity")
+            for r in await all_("SELECT * FROM staff"):
+                guild = self.get_guild(r["guild_id"])
+                member = guild.get_member(r["user_id"]) if guild else None
+                if not member:
+                    continue
+                last_active = datetime.fromisoformat(r["last_active"]) if r["last_active"] else None
+                if not last_active or (now - last_active).total_seconds() < 86400:
+                    continue
+                last_pen = datetime.fromisoformat(r["last_penalty"]) if r["last_penalty"] else None
+                if last_pen and (now - last_pen).total_seconds() < 86400:
+                    continue
+                await ex("UPDATE staff SET last_penalty=? WHERE guild_id=? AND user_id=?",
+                         (now.isoformat(), guild.id, member.id))
+                await award_points(guild, member, -20, "24h inactivity")
+        except Exception:
+            log.exception("staff tick failed")
 
     @staff_tick.before_loop
     async def before_tick(self):
@@ -385,14 +505,12 @@ async def log_to(guild, key: str, embed: discord.Embed):
     s = await settings(guild.id)
     cid = s.get(key) or s.get("log_channel")
     ch = guild.get_channel(cid) if cid else None
-    if ch:
+    if ch and ch.permissions_for(guild.me).send_messages:
         try:
             await ch.send(embed=embed)
         except discord.HTTPException:
             pass
 
-
-# ─────────────────────────── moderation ───────────────────────────
 
 def mod_check():
     async def p(it: discord.Interaction):
@@ -403,90 +521,87 @@ def mod_check():
     return app_commands.check(p)
 
 
+# ─────────────────────────── moderation ───────────────────────────
+
 class Moderation(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
     @app_commands.command(name="ban", description="Ban a member")
     @mod_check()
-    async def ban(self, it, member: discord.Member, reason: str = "No reason given", delete_days: app_commands.Range[int, 0, 7] = 0):
+    async def ban(self, it, member: discord.Member, reason: str = "No reason given",
+                  delete_days: app_commands.Range[int, 0, 7] = 0):
+        if why := can_act(it.guild, it.user, member):
+            return await it.response.send_message(embed=err(why), ephemeral=True)
         await it.response.defer()
-        try: await member.send(embed=wrn(f"You were banned from **{it.guild.name}**.\n**Reason:** {reason}", "🔨 Banned"))
-        except discord.HTTPException: pass
-        await it.guild.ban(member, reason=f"{it.user} — {reason}", delete_message_days=delete_days)
-        e = with_user(err(f"{member.mention} banned.\n**Reason:** {reason}\n**Mod:** {it.user.mention}", "🔨 Member Banned"), member)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+        await it.followup.send(embed=await act_ban(it.guild, it.user, member, reason, delete_days))
 
-    @app_commands.command(name="unban", description="Unban by user ID")
+    @app_commands.command(name="unban", description="Unban a user by ID")
     @mod_check()
     async def unban(self, it, user_id: str, reason: str = "No reason given"):
         await it.response.defer()
         try:
-            u = await self.bot.fetch_user(int(user_id)); await it.guild.unban(u, reason=reason)
-        except Exception:
-            return await it.followup.send(embed=err("User not found or not banned."))
-        e = with_user(ok(f"{u.mention} unbanned.\n**Reason:** {reason}", "🔓 Unbanned"), u)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+            u = await self.bot.fetch_user(int(user_id))
+        except (ValueError, discord.NotFound):
+            return await it.followup.send(embed=err("No such user."))
+        try:
+            await it.followup.send(embed=await act_unban(it.guild, it.user, u, reason))
+        except discord.NotFound:
+            await it.followup.send(embed=err("That user isn't banned."))
 
     @app_commands.command(name="kick", description="Kick a member")
     @mod_check()
     async def kick(self, it, member: discord.Member, reason: str = "No reason given"):
+        if why := can_act(it.guild, it.user, member):
+            return await it.response.send_message(embed=err(why), ephemeral=True)
         await it.response.defer()
-        try: await member.send(embed=wrn(f"You were kicked from **{it.guild.name}**.\n**Reason:** {reason}", "👢 Kicked"))
-        except discord.HTTPException: pass
-        await member.kick(reason=f"{it.user} — {reason}")
-        e = with_user(err(f"{member.mention} kicked.\n**Reason:** {reason}", "👢 Kicked"), member)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+        await it.followup.send(embed=await act_kick(it.guild, it.user, member, reason))
 
-    @app_commands.command(name="softban", description="Ban + instant unban to purge messages")
+    @app_commands.command(name="softban", description="Ban then unban to purge messages")
     @mod_check()
     async def softban(self, it, member: discord.Member, reason: str = "No reason given"):
+        if why := can_act(it.guild, it.user, member):
+            return await it.response.send_message(embed=err(why), ephemeral=True)
         await it.response.defer()
-        await it.guild.ban(member, reason=f"Softban — {reason}", delete_message_days=7)
-        await it.guild.unban(member, reason="Softban")
-        e = with_user(err(f"{member.mention} softbanned.\n**Reason:** {reason}", "🧹 Softbanned"), member)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+        await it.followup.send(embed=await act_softban(it.guild, it.user, member, reason))
 
     @app_commands.command(name="timeout", description="Time out a member")
     @mod_check()
-    async def timeout(self, it, member: discord.Member, minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason given"):
+    async def timeout(self, it, member: discord.Member, minutes: app_commands.Range[int, 1, 40320],
+                      reason: str = "No reason given"):
+        if why := can_act(it.guild, it.user, member):
+            return await it.response.send_message(embed=err(why), ephemeral=True)
         await it.response.defer()
-        until = discord.utils.utcnow() + timedelta(minutes=minutes)
-        await member.timeout(until, reason=reason)
-        e = with_user(wrn(f"{member.mention} muted **{minutes}m**.\n**Ends:** <t:{int(until.timestamp())}:R>\n**Reason:** {reason}", "🔇 Timed Out"), member)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+        await it.followup.send(embed=await act_timeout(it.guild, it.user, member, minutes, reason))
 
     @app_commands.command(name="untimeout", description="Remove a timeout")
     @mod_check()
     async def untimeout(self, it, member: discord.Member):
-        await it.response.defer(); await member.timeout(None, reason=str(it.user))
-        await it.followup.send(embed=ok(f"{member.mention} unmuted."))
+        await member.timeout(None, reason=str(it.user))
+        await it.response.send_message(embed=ok(f"{member.mention} is no longer muted."))
 
     @app_commands.command(name="warn", description="Warn a member")
     @mod_check()
     async def warn(self, it, member: discord.Member, reason: str):
         await it.response.defer()
-        await ex("INSERT INTO warnings (guild_id,user_id,mod_id,reason,created_at) VALUES (?,?,?,?,?)",
-                 (it.guild.id, member.id, it.user.id, reason, discord.utils.utcnow().isoformat()))
-        n = (await one("SELECT COUNT(*) c FROM warnings WHERE guild_id=? AND user_id=?", (it.guild.id, member.id)))["c"]
-        try: await member.send(embed=wrn(f"You were warned in **{it.guild.name}**.\n**Reason:** {reason}\n**Total:** {n}", "⚠️ Warning"))
-        except discord.HTTPException: pass
-        e = with_user(wrn(f"{member.mention} warned (`#{n}`).\n**Reason:** {reason}", "⚠️ Warned"), member)
-        await it.followup.send(embed=e); await log_to(it.guild, "mod_log", e)
+        await it.followup.send(embed=await act_warn(it.guild, it.user, member, reason))
 
     @app_commands.command(name="warnings", description="List a member's warnings")
     async def warnings(self, it, member: discord.Member):
         await it.response.defer()
-        rows = await all_("SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC", (it.guild.id, member.id))
-        if not rows: return await it.followup.send(embed=inf(f"{member.mention} has no warnings."))
+        rows = await all_("SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC",
+                          (it.guild.id, member.id))
+        if not rows:
+            return await it.followup.send(embed=inf(f"{member.mention} has no warnings."))
         body = "\n".join(f"`#{r['id']}` {r['reason']} — <@{r['mod_id']}>" for r in rows[:15])
         await it.followup.send(embed=with_user(pnl(f"📋 {len(rows)} warning(s)", body, WARN), member))
 
     @app_commands.command(name="delwarn", description="Delete a warning by ID")
     @mod_check()
     async def delwarn(self, it, warning_id: int):
-        await it.response.defer()
-        await ex("DELETE FROM warnings WHERE id=? AND guild_id=?", (warning_id, it.guild.id))
-        await it.followup.send(embed=ok(f"Warning `#{warning_id}` deleted."))
+        cur = await ex("DELETE FROM warnings WHERE id=? AND guild_id=?", (warning_id, it.guild.id))
+        if cur.rowcount == 0:
+            return await it.response.send_message(embed=err("No such warning."), ephemeral=True)
+        await it.response.send_message(embed=ok(f"Warning `#{warning_id}` deleted."))
 
     @app_commands.command(name="purge", description="Bulk delete messages")
     @mod_check()
@@ -499,13 +614,14 @@ class Moderation(commands.Cog):
     @mod_check()
     async def slowmode(self, it, seconds: app_commands.Range[int, 0, 21600]):
         await it.channel.edit(slowmode_delay=seconds)
-        await it.response.send_message(embed=ok(f"Slowmode **{seconds}s**."))
+        await it.response.send_message(embed=ok(f"Slowmode set to **{seconds}s** in {it.channel.mention}."))
 
     @app_commands.command(name="lock", description="Lock a channel")
     @mod_check()
     async def lock(self, it, channel: discord.TextChannel | None = None):
         c = channel or it.channel
-        ow = c.overwrites_for(it.guild.default_role); ow.send_messages = False
+        ow = c.overwrites_for(it.guild.default_role)
+        ow.send_messages = False
         await c.set_permissions(it.guild.default_role, overwrite=ow)
         await it.response.send_message(embed=ok(f"🔒 {c.mention} locked."))
 
@@ -513,7 +629,8 @@ class Moderation(commands.Cog):
     @mod_check()
     async def unlock(self, it, channel: discord.TextChannel | None = None):
         c = channel or it.channel
-        ow = c.overwrites_for(it.guild.default_role); ow.send_messages = None
+        ow = c.overwrites_for(it.guild.default_role)
+        ow.send_messages = None
         await c.set_permissions(it.guild.default_role, overwrite=ow)
         await it.response.send_message(embed=ok(f"🔓 {c.mention} unlocked."))
 
@@ -526,6 +643,8 @@ class Moderation(commands.Cog):
     @app_commands.command(name="addrole", description="Give a role")
     @mod_check()
     async def addrole(self, it, member: discord.Member, role: discord.Role):
+        if role >= it.guild.me.top_role:
+            return await it.response.send_message(embed=err("That role is above mine."), ephemeral=True)
         await member.add_roles(role, reason=str(it.user))
         await it.response.send_message(embed=ok(f"Gave {role.mention} to {member.mention}."))
 
@@ -562,10 +681,11 @@ class AutoMod(commands.Cog):
     @app_commands.command(name="blockedwords", description="List blocked words")
     async def blockedwords(self, it):
         rows = await all_("SELECT word FROM blocked_words WHERE guild_id=?", (it.guild.id,))
-        if not rows: return await it.response.send_message(embed=inf("No blocked words."))
+        if not rows:
+            return await it.response.send_message(embed=inf("No blocked words."))
         await it.response.send_message(embed=pnl("🚫 Blocked Words", "`" + "`, `".join(r["word"] for r in rows) + "`"))
 
-    @app_commands.command(name="blockword_punish", description="Set the punishment for blocked words")
+    @app_commands.command(name="blockword_punish", description="Punishment for blocked words")
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(action="delete | warn | timeout | kick | ban")
     async def punish(self, it, action: str, minutes: app_commands.Range[int, 1, 40320] = 10):
@@ -573,7 +693,19 @@ class AutoMod(commands.Cog):
             return await it.response.send_message(embed=err("Use delete, warn, timeout, kick or ban."))
         await setg(it.guild.id, block_punish=action, block_punish_minutes=minutes)
         extra = f" ({minutes}m)" if action == "timeout" else ""
-        await it.response.send_message(embed=ok(f"Blocked-word punishment set to **{action}**{extra}."))
+        await it.response.send_message(embed=ok(f"Punishment set to **{action}**{extra}."))
+
+    @app_commands.command(name="automod_ignore", description="Ignore a channel in automod")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def ignore(self, it, channel: discord.TextChannel):
+        await ex("INSERT OR IGNORE INTO ignored_channels VALUES (?,?)", (it.guild.id, channel.id))
+        await it.response.send_message(embed=ok(f"Automod will ignore {channel.mention}."))
+
+    @app_commands.command(name="automod_unignore", description="Stop ignoring a channel")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def unignore(self, it, channel: discord.TextChannel):
+        await ex("DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?", (it.guild.id, channel.id))
+        await it.response.send_message(embed=ok(f"Automod will moderate {channel.mention} again."))
 
     @commands.Cog.listener()
     async def on_message(self, m: discord.Message):
@@ -582,45 +714,62 @@ class AutoMod(commands.Cog):
         s = await settings(m.guild.id)
         if not s["automod_enabled"] or m.author.guild_permissions.manage_messages:
             return
-        low = m.content.lower()
-        hits = [r["word"] for r in await all_("SELECT word FROM blocked_words WHERE guild_id=?", (m.guild.id,)) if r["word"] in low]
-        key = (m.guild.id, m.author.id)
-        self.bot.spam[key].append((discord.utils.utcnow(), low))
-        recent = [t for t, _ in self.bot.spam[key] if (discord.utils.utcnow() - t).total_seconds() < 6]
-        spammy = len(recent) >= 5
-        if not hits and not spammy:
+        if await one("SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?", (m.guild.id, m.channel.id)):
             return
-        try: await m.delete()
-        except discord.HTTPException: pass
-        reason = f"Blocked word: {', '.join(hits)}" if hits else "Message spam"
+
+        low = m.content.lower()
+        words = await all_("SELECT word FROM blocked_words WHERE guild_id=?", (m.guild.id,))
+        hits = [r["word"] for r in words if r["word"] in low]
+
+        key = (m.guild.id, m.author.id)
+        now = discord.utils.utcnow()
+        bucket = self.bot.spam[key]
+        bucket.append((now, low))
+        recent = [t for t, _ in bucket if (now - t).total_seconds() < 6]
+        texts = [x for _, x in bucket if (now - _[0] if False else True)]
+
+        duplicate = len([t for t, x in bucket if x == low and (now - t).total_seconds() < 20]) >= 3
+        spammy = len(recent) >= 5
+        mention_spam = len(m.mentions) >= 5
+
+        if not (hits or spammy or duplicate or mention_spam):
+            return
+
+        try:
+            await m.delete()
+        except discord.HTTPException:
+            pass
+
+        reason = ("Blocked word: " + ", ".join(hits) if hits else
+                  "Message spam" if spammy else
+                  "Duplicate spam" if duplicate else "Mention spam")
+
         await ex("INSERT INTO warnings (guild_id,user_id,mod_id,reason,created_at) VALUES (?,?,?,?,?)",
-                 (m.guild.id, m.author.id, self.bot.user.id, f"[AUTOMOD] {reason}", discord.utils.utcnow().isoformat()))
-        n = (await one("SELECT COUNT(*) c FROM warnings WHERE guild_id=? AND user_id=?", (m.guild.id, m.author.id)))["c"]
-        note = f"**{n}/{s['automod_escalation']}**"
+                 (m.guild.id, m.author.id, self.bot.user.id, f"[AUTOMOD] {reason}", now.isoformat()))
+        n = (await one("SELECT COUNT(*) c FROM warnings WHERE guild_id=? AND user_id=?",
+                       (m.guild.id, m.author.id)))["c"]
 
         action = s["block_punish"] or "delete"
-        if hits and action != "delete":
-            try:
-                if action == "warn":
-                    pass
-                elif action == "timeout":
-                    await m.author.timeout(discord.utils.utcnow() + timedelta(minutes=s["block_punish_minutes"]), reason=reason)
-                    note += f" — muted {s['block_punish_minutes']}m"
-                elif action == "kick":
-                    await m.author.kick(reason=reason)
-                elif action == "ban":
-                    await m.author.ban(reason=reason, delete_message_days=1)
-            except discord.HTTPException:
-                pass
-        elif n >= s["automod_escalation"]:
-            try:
-                await m.author.timeout(discord.utils.utcnow() + timedelta(minutes=10), reason="Automod escalation")
+        note = f"**{n}/{s['automod_escalation']}**"
+        try:
+            if hits and action == "timeout":
+                await m.author.timeout(now + timedelta(minutes=s["block_punish_minutes"]), reason=reason)
+                note += f" — muted {s['block_punish_minutes']}m"
+            elif hits and action == "kick":
+                await m.author.kick(reason=reason)
+            elif hits and action == "ban":
+                await m.author.ban(reason=reason, delete_message_days=1)
+            elif n >= s["automod_escalation"]:
+                await m.author.timeout(now + timedelta(minutes=10), reason="Automod escalation")
                 note += " — muted 10m"
-            except discord.HTTPException: pass
+        except discord.HTTPException:
+            pass
 
         e = with_user(wrn(f"{m.author.mention} — {reason}\nPunishment: `{action}` · Warnings: {note}", "🤖 Automod"), m.author)
-        try: await m.channel.send(embed=e, delete_after=12)
-        except discord.HTTPException: pass
+        try:
+            await m.channel.send(embed=e, delete_after=12)
+        except discord.HTTPException:
+            pass
         await log_to(m.guild, "mod_log", e)
 
 
@@ -635,12 +784,15 @@ class AntiRaid(commands.Cog):
     async def config(self, it, enabled: bool, threshold: app_commands.Range[int, 2, 50] = 8,
                      window: app_commands.Range[int, 3, 120] = 12, action: str = "alert",
                      min_account_age: app_commands.Range[int, 0, 90] = 0):
+        if action not in ("alert", "kick", "lockdown"):
+            return await it.response.send_message(embed=err("Use alert, kick or lockdown."), ephemeral=True)
         await setg(it.guild.id, antiraid_enabled=int(enabled), antiraid_threshold=threshold,
                    antiraid_window=window, antiraid_action=action, min_account_age=min_account_age)
         await it.response.send_message(embed=pnl("🛡️ Anti-Raid Configured",
-            f"**Enabled:** {enabled}\n**Threshold:** {threshold} joins / {window}s\n**Action:** `{action}`\n**Min account age:** {min_account_age}d"))
+                                                f"**Enabled:** {enabled}\n**Threshold:** {threshold} joins / {window}s\n"
+                                                f"**Action:** `{action}`\n**Min account age:** {min_account_age}d"))
 
-    @app_commands.command(name="raidmode", description="Manually toggle lockdown")
+    @app_commands.command(name="raidmode", description="Toggle lockdown manually")
     @app_commands.checks.has_permissions(administrator=True)
     async def raidmode(self, it, enabled: bool):
         if enabled:
@@ -657,30 +809,41 @@ class AntiRaid(commands.Cog):
             return
         age = (discord.utils.utcnow() - m.created_at).days
         if s["min_account_age"] and age < s["min_account_age"]:
-            try: await m.send(embed=wrn(f"Your account is too new ({age}d) for **{m.guild.name}**.", "🚪 Join Rejected"))
-            except discord.HTTPException: pass
-            await m.kick(reason=f"Account age {age}d < {s['min_account_age']}d")
+            try:
+                await m.send(embed=wrn(f"Your account is too new ({age}d) for **{m.guild.name}**.", "🚪 Join Rejected"))
+            except discord.HTTPException:
+                pass
+            try:
+                await m.kick(reason=f"Account age {age}d < {s['min_account_age']}d")
+            except discord.HTTPException:
+                pass
             return
+
         cache = self.bot.join_cache[m.guild.id]
         now = discord.utils.utcnow().timestamp()
         cache.append(now)
         recent = [t for t in cache if now - t <= s["antiraid_window"]]
         if len(recent) < s["antiraid_threshold"] or self.bot.raid_mode.get(m.guild.id, 0) > now - 30:
             return
+
         self.bot.raid_mode[m.guild.id] = now
         action = s["antiraid_action"]
-        if action == "kick":
-            try: await m.kick(reason="Raid protection")
-            except discord.HTTPException: pass
-        elif action == "lockdown":
-            try: await m.guild.edit(verification_level=discord.VerificationLevel.highest)
-            except discord.HTTPException: pass
-        e = pnl("🚨 Raid Detected",
-                f"**{len(recent)}** joins in **{s['antiraid_window']}s**\n**Action:** `{action}`\n**Trigger:** {m.mention} (`{m.id}`, {age}d old)", ERROR)
+        try:
+            if action == "kick":
+                await m.kick(reason="Raid protection")
+            elif action == "lockdown":
+                await m.guild.edit(verification_level=discord.VerificationLevel.highest)
+        except discord.HTTPException:
+            pass
+
+        e = pnl("🚨 Raid Detected", f"**{len(recent)}** joins in **{s['antiraid_window']}s**\n"
+                                   f"**Action:** `{action}`\n**Trigger:** {m.mention} (`{m.id}`, {age}d old)", ERROR)
         await log_to(m.guild, "join_log", e)
         if m.guild.system_channel:
-            try: await m.guild.system_channel.send(embed=e)
-            except discord.HTTPException: pass
+            try:
+                await m.guild.system_channel.send(embed=e)
+            except discord.HTTPException:
+                pass
 
 
 # ─────────────────────────── welcomer ───────────────────────────
@@ -690,25 +853,32 @@ class Welcomer(commands.Cog):
 
     def render(self, text: str, m) -> str:
         g = getattr(m, "guild", None)
-        return (text.replace("{user}", m.mention if hasattr(m, "mention") else str(m))
-                .replace("{name}", m.name).replace("{server}", g.name if g else "the server")
+        return (text.replace("{user}", getattr(m, "mention", str(m)))
+                .replace("{name}", m.name)
+                .replace("{server}", g.name if g else "the server")
                 .replace("{count}", str(g.member_count if g else 0)))
 
     @app_commands.command(name="welcome", description="Configure the welcomer")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def welcome(self, it, channel: discord.TextChannel, title: str = "🎉 Welcome to {server}!",
+    async def welcome(self, it, channel: discord.TextChannel,
+                      title: str = "🎉 Welcome to {server}!",
                       message: str = "Hey {user}, welcome aboard!\nYou're member **#{count}**. Read the rules and verify to unlock the server.",
                       color: str = "5865F2", image: str | None = None, rules_url: str | None = None):
-        try: col = int(color.replace("#", ""), 16)
-        except ValueError: col = DEFAULT
+        try:
+            col = int(color.replace("#", ""), 16)
+        except ValueError:
+            return await it.response.send_message(embed=err("Colour must be a hex value like `5865F2`."), ephemeral=True)
+        if image and not image.startswith("http"):
+            return await it.response.send_message(embed=err("Image must be a URL."), ephemeral=True)
         await setg(it.guild.id, welcome_channel=channel.id, welcome_title=title,
                    welcome_message=message, welcome_color=col, welcome_image=image)
         self.bot.add_view(WelcomeView(it.guild.id, rules_url))
-        await it.response.send_message(embed=ok(f"Welcomer set to {channel.mention}.\nUse `/welcome_preview` to check it."))
+        await it.response.send_message(embed=ok(f"Welcomer set to {channel.mention}. Preview with `/welcome_preview`."))
 
     @app_commands.command(name="goodbye", description="Configure the goodbye message")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def goodbye(self, it, channel: discord.TextChannel, message: str = "👋 **{name}** left. We're down to **{count}** members."):
+    async def goodbye(self, it, channel: discord.TextChannel,
+                      message: str = "👋 **{name}** left. We're down to **{count}** members."):
         await setg(it.guild.id, goodbye_channel=channel.id, goodbye_message=message)
         await it.response.send_message(embed=ok(f"Goodbye set to {channel.mention}."))
 
@@ -716,10 +886,7 @@ class Welcomer(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def preview(self, it):
         s = await settings(it.guild.id)
-        try:
-            await it.response.send_message(embed=self.build(s, it.user), view=WelcomeView(it.guild.id))
-        except discord.HTTPException as e:
-            await it.response.send_message(embed=err(f"Could not build preview: {e}"))
+        await it.response.send_message(embed=self.build(s, it.user), view=WelcomeView(it.guild.id))
 
     def build(self, s: dict, m) -> discord.Embed:
         color = s["welcome_color"] or DEFAULT
@@ -744,12 +911,14 @@ class Welcomer(commands.Cog):
                 try:
                     await ch.send(content=m.mention, embed=self.build(s, m), view=WelcomeView(m.guild.id))
                 except discord.HTTPException as e:
-                    log.warning("welcome send failed in %s: %s", m.guild.id, e)
+                    log.warning("welcome failed in %s: %s", m.guild.id, e)
         if s["join_log"]:
             ch = m.guild.get_channel(s["join_log"])
             if ch:
                 try:
-                    await ch.send(embed=with_user(inf(f"{m.mention} joined.\n**Created:** <t:{int(m.created_at.timestamp())}:R>\n**ID:** `{m.id}`", "📥 Member Joined"), m))
+                    await ch.send(embed=with_user(
+                        inf(f"{m.mention} joined.\n**Created:** <t:{int(m.created_at.timestamp())}:R>\n**ID:** `{m.id}`",
+                            "📥 Member Joined"), m))
                 except discord.HTTPException:
                     pass
 
@@ -760,7 +929,8 @@ class Welcomer(commands.Cog):
             ch = m.guild.get_channel(s["goodbye_channel"])
             if ch:
                 try:
-                    await ch.send(embed=with_user(pnl("👋 Member Left", self.render(s["goodbye_message"] or "**{name}** left.", m), ERROR), m))
+                    await ch.send(embed=with_user(
+                        pnl("👋 Member Left", self.render(s["goodbye_message"] or "**{name}** left.", m), ERROR), m))
                 except discord.HTTPException:
                     pass
 
@@ -780,6 +950,8 @@ class Verification(commands.Cog):
                      description: str = "Click the button below to verify through our website.\nYour IP is logged to keep alts and raiders out."):
         if not link_ok():
             return await it.response.send_message(embed=err("`WEB_URL` is not configured on the host."), ephemeral=True)
+        if role >= it.guild.me.top_role:
+            return await it.response.send_message(embed=err("That role is above mine — drag my role higher."), ephemeral=True)
         await setg(it.guild.id, verify_enabled=1, verify_role=role.id,
                    unverified_role=unverified_role.id if unverified_role else None,
                    verify_log=log_channel.id if log_channel else None)
@@ -791,7 +963,8 @@ class Verification(commands.Cog):
             await channel.send(embed=e, view=VerifyView(it.guild.id))
         except discord.HTTPException as ex_:
             return await it.response.send_message(embed=err(f"Could not post panel: {ex_}"), ephemeral=True)
-        await it.response.send_message(embed=ok(f"Verification **enabled**. Panel posted in {channel.mention}.\nRole: {role.mention}"), ephemeral=True)
+        await it.response.send_message(
+            embed=ok(f"Verification **enabled**. Panel posted in {channel.mention}. Role: {role.mention}"), ephemeral=True)
 
     @group.command(name="disable", description="Disable verification")
     @app_commands.checks.has_permissions(administrator=True)
@@ -805,32 +978,46 @@ class Verification(commands.Cog):
         role = it.guild.get_role(s["verify_role"]) if s["verify_role"] else None
         ch = it.guild.get_channel(s["verify_log"]) if s["verify_log"] else None
         n = (await one("SELECT COUNT(*) c FROM verifications WHERE guild_id=?", (it.guild.id,)))["c"]
-        e = pnl("🔐 Verification Status", "\n".join([
+        await it.response.send_message(embed=pnl("🔐 Verification Status", "\n".join([
             f"**Enabled:** {'🟢 yes' if s['verify_enabled'] else '🔴 no'}",
             f"**Role:** {role.mention if role else '—'}",
             f"**Log channel:** {ch.mention if ch else '—'}",
             f"**Verified members:** `{n}`",
             f"**Web URL:** `{WEB_URL or 'not set'}`",
-        ]))
-        await it.response.send_message(embed=e, ephemeral=True)
+        ])), ephemeral=True)
 
     @group.command(name="alts", description="Show detected alts for a member")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def alts(self, it, member: discord.Member):
         rows = await all_("SELECT * FROM alts WHERE guild_id=? AND user_id=?", (it.guild.id, member.id))
         v = await one("SELECT * FROM verifications WHERE guild_id=? AND user_id=?", (it.guild.id, member.id))
-        if not v: return await it.response.send_message(embed=inf(f"{member.mention} hasn't verified."))
+        if not v:
+            return await it.response.send_message(embed=inf(f"{member.mention} hasn't verified."), ephemeral=True)
         body = "\n".join(f"• <@{r['matched_user_id']}> — {r['reason']}" for r in rows) or "None"
         await it.response.send_message(embed=with_user(pnl("👥 Alt Check",
-            f"**IP:** `{v['ip']}`\n**Verified:** <t:{int(datetime.fromisoformat(v['verified_at']).timestamp())}:R>\n\n**Matches:**\n{body}"), member))
+            f"**IP:** `{v['ip']}`\n**Verified:** <t:{int(datetime.fromisoformat(v['verified_at']).timestamp())}:R>\n\n"
+            f"**Matches:**\n{body}"), member))
 
     @group.command(name="whois", description="Show a member's verification record")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def whois(self, it, member: discord.Member):
         v = await one("SELECT * FROM verifications WHERE guild_id=? AND user_id=?", (it.guild.id, member.id))
-        if not v: return await it.response.send_message(embed=inf("No record."))
+        if not v:
+            return await it.response.send_message(embed=inf("No record."), ephemeral=True)
         await it.response.send_message(embed=with_user(pnl("🕵️ Verification Record",
-            f"**IP:** `{v['ip']}`\n**User agent:** `{v['user_agent'][:80]}`\n**Verified:** <t:{int(datetime.fromisoformat(v['verified_at']).timestamp())}:F>"), member))
+            f"**IP:** `{v['ip']}`\n**User agent:** `{v['user_agent'][:80]}`\n"
+            f"**Verified:** <t:{int(datetime.fromisoformat(v['verified_at']).timestamp())}:F>"), member))
+
+    @commands.Cog.listener()
+    async def on_member_join(self, m: discord.Member):
+        s = await settings(m.guild.id)
+        if s["verify_enabled"] and s["unverified_role"]:
+            role = m.guild.get_role(s["unverified_role"])
+            if role:
+                try:
+                    await m.add_roles(role, reason="Unverified")
+                except discord.HTTPException:
+                    pass
 
 
 # ─────────────────────────── logs ───────────────────────────
@@ -843,20 +1030,25 @@ class Logs(commands.Cog):
     @app_commands.describe(kind="all | mod | join | verify")
     async def logs(self, it, channel: discord.TextChannel, kind: str = "all"):
         m = {"all": "log_channel", "mod": "mod_log", "join": "join_log", "verify": "verify_log"}
-        if kind not in m: return await it.response.send_message(embed=err("Use all, mod, join or verify."))
+        if kind not in m:
+            return await it.response.send_message(embed=err("Use all, mod, join or verify."), ephemeral=True)
         await setg(it.guild.id, **{m[kind]: channel.id})
         await it.response.send_message(embed=ok(f"`{kind}` logs → {channel.mention}."))
 
     @commands.Cog.listener()
     async def on_message_delete(self, m: discord.Message):
-        if not m.guild or m.author.bot: return
-        await log_to(m.guild, "log_channel", with_user(pnl("🗑️ Message Deleted", f"**Channel:** {m.channel.mention}\n```{m.content[:900] or '—'}```", WARN), m.author))
+        if not m.guild or m.author.bot:
+            return
+        await log_to(m.guild, "log_channel", with_user(
+            pnl("🗑️ Message Deleted", f"**Channel:** {m.channel.mention}\n```{m.content[:900] or '—'}```", WARN), m.author))
 
     @commands.Cog.listener()
     async def on_message_edit(self, a: discord.Message, b: discord.Message):
-        if not a.guild or a.author.bot or a.content == b.content: return
+        if not a.guild or a.author.bot or a.content == b.content:
+            return
         await log_to(a.guild, "log_channel", with_user(pnl("✏️ Message Edited",
-            f"**Channel:** {a.channel.mention}\n**Before:**\n```{a.content[:400]}```\n**After:**\n```{b.content[:400]}```", INFO), a.author))
+            f"**Channel:** {a.channel.mention}\n**Before:**\n```{a.content[:400]}```\n**After:**\n```{b.content[:400]}```",
+            INFO), a.author))
 
     @commands.Cog.listener()
     async def on_member_update(self, a: discord.Member, b: discord.Member):
@@ -867,11 +1059,13 @@ class Logs(commands.Cog):
                 await log_to(b.guild, "log_channel", with_user(pnl("🎭 Roles Updated",
                     f"**Added:** {', '.join(added) or '—'}\n**Removed:** {', '.join(removed) or '—'}", INFO), b))
         if a.nick != b.nick:
-            await log_to(b.guild, "log_channel", with_user(pnl("📝 Nickname Changed", f"`{a.nick}` → `{b.nick}`", NEUTRAL), b))
+            await log_to(b.guild, "log_channel", with_user(
+                pnl("📝 Nickname Changed", f"`{a.nick}` → `{b.nick}`", NEUTRAL), b))
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, m, before, after):
-        if before.channel == after.channel: return
+        if before.channel == after.channel:
+            return
         if before.channel is None:
             await log_to(m.guild, "log_channel", with_user(pnl("🔊 Joined Voice", after.channel.mention, SUCCESS), m))
         elif after.channel is None:
@@ -886,7 +1080,10 @@ class Staff(commands.Cog):
     @app_commands.command(name="staff_setup", description="Set the sign-in channel and trigger word")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup(self, it, channel: discord.TextChannel, signin_word: str, signout_word: str = "signout"):
-        await setg(it.guild.id, signin_channel=channel.id, signin_word=signin_word.lower(), signout_word=signout_word.lower())
+        if " " in signin_word:
+            return await it.response.send_message(embed=err("The word can't contain spaces."), ephemeral=True)
+        await setg(it.guild.id, signin_channel=channel.id,
+                   signin_word=signin_word.lower(), signout_word=signout_word.lower())
         self.bot.add_view(StaffPanelView(it.guild.id))
         e = pnl("🛡️ Staff Duty Channel",
                 f"Type **{signin_word}** in {channel.mention} to start your shift.\n"
@@ -896,7 +1093,8 @@ class Staff(commands.Cog):
                 "• Promotions are automatic by points.")
         e.set_footer(text=it.guild.name, icon_url=it.guild.icon.url if it.guild.icon else None)
         await channel.send(embed=e)
-        await it.response.send_message(embed=ok(f"Sign-in channel set to {channel.mention} with word `{signin_word}`."), ephemeral=True)
+        await it.response.send_message(embed=ok(f"Sign-in channel set to {channel.mention} with word `{signin_word}`."),
+                                      ephemeral=True)
 
     @app_commands.command(name="staff", description="Post the staff duty panel")
     @app_commands.checks.has_permissions(administrator=True)
@@ -913,6 +1111,8 @@ class Staff(commands.Cog):
     @app_commands.command(name="rank_add", description="Add a promotion rank")
     @app_commands.checks.has_permissions(administrator=True)
     async def rank_add(self, it, name: str, points: app_commands.Range[int, 1, 100000], role: discord.Role):
+        if await one("SELECT 1 FROM staff_ranks WHERE guild_id=? AND name=?", (it.guild.id, name)):
+            return await it.response.send_message(embed=err("A rank with that name exists."), ephemeral=True)
         n = (await one("SELECT COUNT(*) c FROM staff_ranks WHERE guild_id=?", (it.guild.id,)))["c"]
         await ex("INSERT INTO staff_ranks (guild_id,name,threshold,role_id,position) VALUES (?,?,?,?,?)",
                  (it.guild.id, name, points, role.id, n))
@@ -921,34 +1121,42 @@ class Staff(commands.Cog):
     @app_commands.command(name="ranks", description="List promotion ranks")
     async def ranks(self, it):
         rows = await all_("SELECT * FROM staff_ranks WHERE guild_id=? ORDER BY threshold", (it.guild.id,))
-        if not rows: return await it.response.send_message(embed=inf("No ranks configured."))
+        if not rows:
+            return await it.response.send_message(embed=inf("No ranks configured."), ephemeral=True)
         await it.response.send_message(embed=pnl("📈 Promotion Ladder",
-            "\n".join(f"`{r['threshold']}` → **{r['name']}** (<@&{r['role_id']}>)" for r in rows)))
+            "\n".join(f"`{r['threshold']}` → **{r['name']}** (<@&{r['role_id']}>)" for r in rows)), ephemeral=True)
 
     @app_commands.command(name="rank_remove", description="Remove a rank")
     @app_commands.checks.has_permissions(administrator=True)
     async def rank_remove(self, it, name: str):
-        await ex("DELETE FROM staff_ranks WHERE guild_id=? AND name=?", (it.guild.id, name))
+        cur = await ex("DELETE FROM staff_ranks WHERE guild_id=? AND name=?", (it.guild.id, name))
+        if cur.rowcount == 0:
+            return await it.response.send_message(embed=err("No such rank."), ephemeral=True)
         await it.response.send_message(embed=ok(f"Removed rank `{name}`."))
 
     @app_commands.command(name="promote", description="Promote a staff member manually")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def promote(self, it, member: discord.Member, rank: str):
         r = await one("SELECT * FROM staff_ranks WHERE guild_id=? AND name=?", (it.guild.id, rank))
-        if not r: return await it.response.send_message(embed=err("Unknown rank."))
+        if not r:
+            return await it.response.send_message(embed=err("Unknown rank."), ephemeral=True)
         role = it.guild.get_role(r["role_id"])
-        if not role: return await it.response.send_message(embed=err("Rank role no longer exists."))
+        if not role:
+            return await it.response.send_message(embed=err("Rank role no longer exists."), ephemeral=True)
         await member.add_roles(role, reason=f"Manual promotion by {it.user}")
         e = with_user(pnl("📈 Promotion", f"{member.mention} promoted to **{rank}** by {it.user.mention}.", SUCCESS), member)
-        await it.response.send_message(embed=e); await log_to(it.guild, "log_channel", e)
+        await it.response.send_message(embed=e)
+        await log_to(it.guild, "log_channel", e)
 
     @app_commands.command(name="demote", description="Remove a rank role")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def demote(self, it, member: discord.Member, rank: str):
         r = await one("SELECT * FROM staff_ranks WHERE guild_id=? AND name=?", (it.guild.id, rank))
-        if not r: return await it.response.send_message(embed=err("Unknown rank."))
+        if not r:
+            return await it.response.send_message(embed=err("Unknown rank."), ephemeral=True)
         role = it.guild.get_role(r["role_id"])
-        if role: await member.remove_roles(role, reason=f"Demoted by {it.user}")
+        if role:
+            await member.remove_roles(role, reason=f"Demoted by {it.user}")
         await it.response.send_message(embed=ok(f"{member.mention} demoted from **{rank}**."))
 
     @app_commands.command(name="points", description="Adjust a staff member's points")
@@ -962,20 +1170,22 @@ class Staff(commands.Cog):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def staffstats(self, it, member: discord.Member):
         r = await one("SELECT * FROM staff WHERE guild_id=? AND user_id=?", (it.guild.id, member.id))
-        if not r: return await it.response.send_message(embed=inf("No staff record."))
-        h, m = r["total_seconds"] // 3600, (r["total_seconds"] % 3600) // 60
+        if not r:
+            return await it.response.send_message(embed=inf("No staff record."), ephemeral=True)
         await it.response.send_message(embed=with_user(pnl("📊 Staff Record",
-            f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n**Total time:** `{h}h {m}m`\n"
-            f"**On duty:** {'🟢' if r['on_duty'] else '🔴'}\n**Last sign-in:** {r['last_signin'] or '—'}\n"
-            f"**Last activity:** {r['last_active'] or '—'}"), member))
+            f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n"
+            f"**Total time:** `{fmt_dur(r['total_seconds'])}`\n**On duty:** {'🟢' if r['on_duty'] else '🔴'}\n"
+            f"**Last sign-in:** {r['last_signin'] or '—'}\n**Last activity:** {r['last_active'] or '—'}"), member))
 
     @app_commands.command(name="stafftop", description="Staff activity leaderboard")
     async def stafftop(self, it):
         rows = await all_("SELECT * FROM staff WHERE guild_id=? ORDER BY points DESC LIMIT 10", (it.guild.id,))
-        if not rows: return await it.response.send_message(embed=inf("No data yet."))
+        if not rows:
+            return await it.response.send_message(embed=inf("No data yet."), ephemeral=True)
         medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 7
         await it.response.send_message(embed=pnl("🏆 Staff Leaderboard",
-            "\n".join(f"{medals[i]} <@{r['user_id']}> — `{r['points']}` pts · `{r['days_present']}` days" for i, r in enumerate(rows))))
+            "\n".join(f"{medals[i]} <@{r['user_id']}> — `{r['points']}` pts · `{r['days_present']}` days"
+                      for i, r in enumerate(rows))))
 
     @commands.Cog.listener()
     async def on_message(self, m: discord.Message):
@@ -983,13 +1193,13 @@ class Staff(commands.Cog):
             return
         s = await settings(m.guild.id)
 
-        # message activity tracking for existing staff
         r = await one("SELECT * FROM staff WHERE guild_id=? AND user_id=?", (m.guild.id, m.author.id))
         if r:
             now = discord.utils.utcnow()
             today = now.date().isoformat()
             count = r["msg_count"] + 1 if r["msg_date"] == today else 1
-            await ex("UPDATE staff SET msg_count=?, msg_date=?, last_message=?, last_active=? WHERE guild_id=? AND user_id=?",
+            await ex("UPDATE staff SET msg_count=?, msg_date=?, last_message=?, last_active=? "
+                     "WHERE guild_id=? AND user_id=?",
                      (count, today, now.isoformat(), now.isoformat(), m.guild.id, m.author.id))
             if count % 20 == 0:
                 await award_points(m.guild, m.author, 5, "20 messages today")
@@ -998,14 +1208,20 @@ class Staff(commands.Cog):
             return
         word = m.content.strip().lower()
         if s["signin_word"] and word == s["signin_word"]:
-            good, _, emb = await staff_signin(m.guild, m.author)
-            await m.channel.send(embed=emb, delete_after=20)
+            _, _, emb = await staff_signin(m.guild, m.author)
+            try:
+                await m.channel.send(embed=emb, delete_after=20)
+            except discord.HTTPException:
+                pass
         elif s["signout_word"] and word == s["signout_word"]:
-            good, _, emb = await staff_signout(m.guild, m.author, "word")
-            await m.channel.send(embed=emb, delete_after=20)
+            _, _, emb = await staff_signout(m.guild, m.author, "word")
+            try:
+                await m.channel.send(embed=emb, delete_after=20)
+            except discord.HTTPException:
+                pass
 
 
-# ─────────────────────────── prefix commands ───────────────────────────
+# ─────────────────────────── prefix ───────────────────────────
 
 class Prefix(commands.Cog):
     def __init__(self, bot): self.bot = bot
@@ -1017,46 +1233,39 @@ class Prefix(commands.Cog):
     @commands.command(name="ban")
     @commands.has_guild_permissions(ban_members=True)
     async def ban(self, ctx, member: discord.Member, *, reason: str = "No reason given"):
-        try: await member.send(embed=wrn(f"You were banned from **{ctx.guild.name}**.\n**Reason:** {reason}", "🔨 Banned"))
-        except discord.HTTPException: pass
-        await ctx.guild.ban(member, reason=f"{ctx.author} — {reason}", delete_message_days=0)
-        e = with_user(err(f"{member.mention} banned.\n**Reason:** {reason}\n**Mod:** {ctx.author.mention}", "🔨 Member Banned"), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+        if why := can_act(ctx.guild, ctx.author, member):
+            return await ctx.send(embed=err(why))
+        await ctx.send(embed=await act_ban(ctx.guild, ctx.author, member, reason))
 
     @commands.command(name="unban")
     @commands.has_guild_permissions(ban_members=True)
     async def unban(self, ctx, user_id: int, *, reason: str = "No reason given"):
         try:
-            u = await self.bot.fetch_user(user_id); await ctx.guild.unban(u, reason=reason)
-        except Exception:
-            return await ctx.send(embed=err("User not found or not banned."))
-        e = with_user(ok(f"{u.mention} unbanned.\n**Reason:** {reason}", "🔓 Unbanned"), u)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+            u = await self.bot.fetch_user(user_id)
+            await ctx.send(embed=await act_unban(ctx.guild, ctx.author, u, reason))
+        except (discord.NotFound, discord.HTTPException):
+            await ctx.send(embed=err("User not found or not banned."))
 
     @commands.command(name="kick")
     @commands.has_guild_permissions(kick_members=True)
     async def kick(self, ctx, member: discord.Member, *, reason: str = "No reason given"):
-        try: await member.send(embed=wrn(f"You were kicked from **{ctx.guild.name}**.\n**Reason:** {reason}", "👢 Kicked"))
-        except discord.HTTPException: pass
-        await member.kick(reason=f"{ctx.author} — {reason}")
-        e = with_user(err(f"{member.mention} kicked.\n**Reason:** {reason}", "👢 Kicked"), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+        if why := can_act(ctx.guild, ctx.author, member):
+            return await ctx.send(embed=err(why))
+        await ctx.send(embed=await act_kick(ctx.guild, ctx.author, member, reason))
 
     @commands.command(name="softban")
     @commands.has_guild_permissions(ban_members=True)
     async def softban(self, ctx, member: discord.Member, *, reason: str = "No reason given"):
-        await ctx.guild.ban(member, reason=f"Softban — {reason}", delete_message_days=7)
-        await ctx.guild.unban(member, reason="Softban")
-        e = with_user(err(f"{member.mention} softbanned.\n**Reason:** {reason}", "🧹 Softbanned"), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+        if why := can_act(ctx.guild, ctx.author, member):
+            return await ctx.send(embed=err(why))
+        await ctx.send(embed=await act_softban(ctx.guild, ctx.author, member, reason))
 
     @commands.command(name="timeout", aliases=["mute"])
     @commands.has_guild_permissions(moderate_members=True)
     async def timeout(self, ctx, member: discord.Member, minutes: int, *, reason: str = "No reason given"):
-        until = discord.utils.utcnow() + timedelta(minutes=minutes)
-        await member.timeout(until, reason=reason)
-        e = with_user(wrn(f"{member.mention} muted **{minutes}m**.\n**Reason:** {reason}", "🔇 Timed Out"), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+        if why := can_act(ctx.guild, ctx.author, member):
+            return await ctx.send(embed=err(why))
+        await ctx.send(embed=await act_timeout(ctx.guild, ctx.author, member, minutes, reason))
 
     @commands.command(name="untimeout", aliases=["unmute"])
     @commands.has_guild_permissions(moderate_members=True)
@@ -1067,29 +1276,32 @@ class Prefix(commands.Cog):
     @commands.command(name="warn")
     @commands.has_guild_permissions(manage_messages=True)
     async def warn(self, ctx, member: discord.Member, *, reason: str):
-        await ex("INSERT INTO warnings (guild_id,user_id,mod_id,reason,created_at) VALUES (?,?,?,?,?)",
-                 (ctx.guild.id, member.id, ctx.author.id, reason, discord.utils.utcnow().isoformat()))
-        n = (await one("SELECT COUNT(*) c FROM warnings WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id)))["c"]
-        e = with_user(wrn(f"{member.mention} warned (`#{n}`).\n**Reason:** {reason}", "⚠️ Warned"), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "mod_log", e)
+        await ctx.send(embed=await act_warn(ctx.guild, ctx.author, member, reason))
 
     @commands.command(name="warnings")
     async def warnings(self, ctx, member: discord.Member):
-        rows = await all_("SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC", (ctx.guild.id, member.id))
-        if not rows: return await ctx.send(embed=inf(f"{member.mention} has no warnings."))
+        rows = await all_("SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC",
+                          (ctx.guild.id, member.id))
+        if not rows:
+            return await ctx.send(embed=inf(f"{member.mention} has no warnings."))
         body = "\n".join(f"`#{r['id']}` {r['reason']} — <@{r['mod_id']}>" for r in rows[:15])
         await ctx.send(embed=with_user(pnl(f"📋 {len(rows)} warning(s)", body, WARN), member))
 
     @commands.command(name="delwarn")
     @commands.has_guild_permissions(manage_messages=True)
     async def delwarn(self, ctx, warning_id: int):
-        await ex("DELETE FROM warnings WHERE id=? AND guild_id=?", (warning_id, ctx.guild.id))
+        cur = await ex("DELETE FROM warnings WHERE id=? AND guild_id=?", (warning_id, ctx.guild.id))
+        if cur.rowcount == 0:
+            return await ctx.send(embed=err("No such warning."))
         await ctx.send(embed=ok(f"Warning `#{warning_id}` deleted."))
 
     @commands.command(name="purge", aliases=["clear"])
     @commands.has_guild_permissions(manage_messages=True)
     async def purge(self, ctx, amount: int = 10, member: discord.Member | None = None):
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
         d = await ctx.channel.purge(limit=amount, check=(lambda m: m.author.id == member.id) if member else None)
         await ctx.send(embed=ok(f"Deleted **{len(d)}** message(s)."), delete_after=5)
 
@@ -1103,7 +1315,8 @@ class Prefix(commands.Cog):
     @commands.has_guild_permissions(manage_channels=True)
     async def lock(self, ctx, channel: discord.TextChannel | None = None):
         c = channel or ctx.channel
-        ow = c.overwrites_for(ctx.guild.default_role); ow.send_messages = False
+        ow = c.overwrites_for(ctx.guild.default_role)
+        ow.send_messages = False
         await c.set_permissions(ctx.guild.default_role, overwrite=ow)
         await ctx.send(embed=ok(f"🔒 {c.mention} locked."))
 
@@ -1111,7 +1324,8 @@ class Prefix(commands.Cog):
     @commands.has_guild_permissions(manage_channels=True)
     async def unlock(self, ctx, channel: discord.TextChannel | None = None):
         c = channel or ctx.channel
-        ow = c.overwrites_for(ctx.guild.default_role); ow.send_messages = None
+        ow = c.overwrites_for(ctx.guild.default_role)
+        ow.send_messages = None
         await c.set_permissions(ctx.guild.default_role, overwrite=ow)
         await ctx.send(embed=ok(f"🔓 {c.mention} unlocked."))
 
@@ -1124,6 +1338,8 @@ class Prefix(commands.Cog):
     @commands.command(name="addrole")
     @commands.has_guild_permissions(manage_roles=True)
     async def addrole(self, ctx, member: discord.Member, role: discord.Role):
+        if role >= ctx.guild.me.top_role:
+            return await ctx.send(embed=err("That role is above mine."))
         await member.add_roles(role, reason=str(ctx.author))
         await ctx.send(embed=ok(f"Gave {role.mention} to {member.mention}."))
 
@@ -1148,7 +1364,8 @@ class Prefix(commands.Cog):
     @commands.command(name="blockedwords")
     async def blockedwords(self, ctx):
         rows = await all_("SELECT word FROM blocked_words WHERE guild_id=?", (ctx.guild.id,))
-        if not rows: return await ctx.send(embed=inf("No blocked words."))
+        if not rows:
+            return await ctx.send(embed=inf("No blocked words."))
         await ctx.send(embed=pnl("🚫 Blocked Words", "`" + "`, `".join(r["word"] for r in rows) + "`"))
 
     @commands.command(name="blockpunish")
@@ -1164,6 +1381,12 @@ class Prefix(commands.Cog):
     async def automod(self, ctx, enabled: bool):
         await setg(ctx.guild.id, automod_enabled=int(enabled))
         await ctx.send(embed=ok(f"Automod {'enabled' if enabled else 'disabled'}."))
+
+    @commands.command(name="automodignore")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def automodignore(self, ctx, channel: discord.TextChannel):
+        await ex("INSERT OR IGNORE INTO ignored_channels VALUES (?,?)", (ctx.guild.id, channel.id))
+        await ctx.send(embed=ok(f"Automod ignores {channel.mention}."))
 
     @commands.command(name="antiraid")
     @commands.has_guild_permissions(administrator=True)
@@ -1184,7 +1407,8 @@ class Prefix(commands.Cog):
 
     @commands.command(name="welcome")
     @commands.has_guild_permissions(manage_guild=True)
-    async def welcome(self, ctx, channel: discord.TextChannel, *, message: str = "Hey {user}, welcome to **{server}**! You're member **#{count}**."):
+    async def welcome(self, ctx, channel: discord.TextChannel, *,
+                      message: str = "Hey {user}, welcome to **{server}**! You're member **#{count}**."):
         await setg(ctx.guild.id, welcome_channel=channel.id, welcome_message=message)
         self.bot.add_view(WelcomeView(ctx.guild.id))
         await ctx.send(embed=ok(f"Welcomer set to {channel.mention}."))
@@ -1198,14 +1422,18 @@ class Prefix(commands.Cog):
     @commands.group(name="verify", invoke_without_command=True)
     async def verify(self, ctx):
         s = await settings(ctx.guild.id)
-        await ctx.send(embed=pnl("🔐 Verification Status", f"**Enabled:** {'🟢' if s['verify_enabled'] else '🔴'}\n"
+        await ctx.send(embed=pnl("🔐 Verification Status",
+                                 f"**Enabled:** {'🟢' if s['verify_enabled'] else '🔴'}\n"
                                  f"**Web URL:** `{WEB_URL or 'not set'}`\n\n`!verify enable #channel @role`"))
 
     @verify.command(name="enable")
     @commands.has_guild_permissions(administrator=True)
-    async def verify_enable(self, ctx, channel: discord.TextChannel, role: discord.Role, log_channel: discord.TextChannel | None = None):
+    async def verify_enable(self, ctx, channel: discord.TextChannel, role: discord.Role,
+                            log_channel: discord.TextChannel | None = None):
         if not link_ok():
             return await ctx.send(embed=err("`WEB_URL` is not configured."))
+        if role >= ctx.guild.me.top_role:
+            return await ctx.send(embed=err("That role is above mine."))
         await setg(ctx.guild.id, verify_enabled=1, verify_role=role.id,
                    verify_log=log_channel.id if log_channel else None)
         self.bot.add_view(VerifyView(ctx.guild.id))
@@ -1225,7 +1453,8 @@ class Prefix(commands.Cog):
     async def verify_alts(self, ctx, member: discord.Member):
         rows = await all_("SELECT * FROM alts WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id))
         v = await one("SELECT * FROM verifications WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id))
-        if not v: return await ctx.send(embed=inf("Not verified."))
+        if not v:
+            return await ctx.send(embed=inf("Not verified."))
         body = "\n".join(f"• <@{r['matched_user_id']}>" for r in rows) or "None"
         await ctx.send(embed=with_user(pnl("👥 Alt Check", f"**IP:** `{v['ip']}`\n\n{body}"), member))
 
@@ -1233,21 +1462,24 @@ class Prefix(commands.Cog):
     @commands.has_guild_permissions(manage_guild=True)
     async def whois(self, ctx, member: discord.Member):
         v = await one("SELECT * FROM verifications WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id))
-        if not v: return await ctx.send(embed=inf("No record."))
+        if not v:
+            return await ctx.send(embed=inf("No record."))
         await ctx.send(embed=with_user(pnl("🕵️ Record", f"**IP:** `{v['ip']}`\n**UA:** `{v['user_agent'][:70]}`"), member))
 
     @commands.command(name="logs")
     @commands.has_guild_permissions(manage_guild=True)
     async def logs(self, ctx, channel: discord.TextChannel, kind: str = "all"):
         m = {"all": "log_channel", "mod": "mod_log", "join": "join_log", "verify": "verify_log"}
-        if kind not in m: return await ctx.send(embed=err("Use all, mod, join or verify."))
+        if kind not in m:
+            return await ctx.send(embed=err("Use all, mod, join or verify."))
         await setg(ctx.guild.id, **{m[kind]: channel.id})
         await ctx.send(embed=ok(f"`{kind}` logs → {channel.mention}."))
 
     @commands.command(name="staffsetup")
     @commands.has_guild_permissions(administrator=True)
     async def staffsetup(self, ctx, channel: discord.TextChannel, signin_word: str, signout_word: str = "signout"):
-        await setg(ctx.guild.id, signin_channel=channel.id, signin_word=signin_word.lower(), signout_word=signout_word.lower())
+        await setg(ctx.guild.id, signin_channel=channel.id,
+                   signin_word=signin_word.lower(), signout_word=signout_word.lower())
         await channel.send(embed=pnl("🛡️ Staff Duty Channel",
             f"Type **{signin_word}** to start your shift, **{signout_word}** to end it.\n"
             "1 hour on duty = +5 points · 20 messages/day = +5 points · idle 1h = auto sign-out · 24h inactive = −20 points."))
@@ -1266,6 +1498,8 @@ class Prefix(commands.Cog):
     @commands.command(name="rankadd")
     @commands.has_guild_permissions(administrator=True)
     async def rankadd(self, ctx, name: str, points: int, role: discord.Role):
+        if await one("SELECT 1 FROM staff_ranks WHERE guild_id=? AND name=?", (ctx.guild.id, name)):
+            return await ctx.send(embed=err("A rank with that name exists."))
         n = (await one("SELECT COUNT(*) c FROM staff_ranks WHERE guild_id=?", (ctx.guild.id,)))["c"]
         await ex("INSERT INTO staff_ranks (guild_id,name,threshold,role_id,position) VALUES (?,?,?,?,?)",
                  (ctx.guild.id, name, points, role.id, n))
@@ -1274,27 +1508,33 @@ class Prefix(commands.Cog):
     @commands.command(name="ranks")
     async def ranks(self, ctx):
         rows = await all_("SELECT * FROM staff_ranks WHERE guild_id=? ORDER BY threshold", (ctx.guild.id,))
-        if not rows: return await ctx.send(embed=inf("No ranks configured."))
+        if not rows:
+            return await ctx.send(embed=inf("No ranks configured."))
         await ctx.send(embed=pnl("📈 Promotion Ladder", "\n".join(f"`{r['threshold']}` → **{r['name']}**" for r in rows)))
 
     @commands.command(name="promote")
     @commands.has_guild_permissions(manage_guild=True)
     async def promote(self, ctx, member: discord.Member, *, rank: str):
         r = await one("SELECT * FROM staff_ranks WHERE guild_id=? AND name=?", (ctx.guild.id, rank))
-        if not r: return await ctx.send(embed=err("Unknown rank."))
+        if not r:
+            return await ctx.send(embed=err("Unknown rank."))
         role = ctx.guild.get_role(r["role_id"])
-        if not role: return await ctx.send(embed=err("Rank role missing."))
+        if not role:
+            return await ctx.send(embed=err("Rank role missing."))
         await member.add_roles(role, reason=f"Manual promotion by {ctx.author}")
         e = with_user(pnl("📈 Promotion", f"{member.mention} → **{rank}**.", SUCCESS), member)
-        await ctx.send(embed=e); await log_to(ctx.guild, "log_channel", e)
+        await ctx.send(embed=e)
+        await log_to(ctx.guild, "log_channel", e)
 
     @commands.command(name="demote")
     @commands.has_guild_permissions(manage_guild=True)
     async def demote(self, ctx, member: discord.Member, *, rank: str):
         r = await one("SELECT * FROM staff_ranks WHERE guild_id=? AND name=?", (ctx.guild.id, rank))
-        if not r: return await ctx.send(embed=err("Unknown rank."))
+        if not r:
+            return await ctx.send(embed=err("Unknown rank."))
         role = ctx.guild.get_role(r["role_id"])
-        if role: await member.remove_roles(role, reason=f"Demoted by {ctx.author}")
+        if role:
+            await member.remove_roles(role, reason=f"Demoted by {ctx.author}")
         await ctx.send(embed=ok(f"{member.mention} demoted from **{rank}**."))
 
     @commands.command(name="points")
@@ -1308,16 +1548,17 @@ class Prefix(commands.Cog):
     @commands.has_guild_permissions(manage_guild=True)
     async def staffstats(self, ctx, member: discord.Member):
         r = await one("SELECT * FROM staff WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id))
-        if not r: return await ctx.send(embed=inf("No staff record."))
-        h, m = r["total_seconds"] // 3600, (r["total_seconds"] % 3600) // 60
+        if not r:
+            return await ctx.send(embed=inf("No staff record."))
         await ctx.send(embed=with_user(pnl("📊 Staff Record",
-            f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n**Total:** `{h}h {m}m`\n"
-            f"**On duty:** {'🟢' if r['on_duty'] else '🔴'}"), member))
+            f"**Points:** `{r['points']}`\n**Days present:** `{r['days_present']}`\n"
+            f"**Total:** `{fmt_dur(r['total_seconds'])}`\n**On duty:** {'🟢' if r['on_duty'] else '🔴'}"), member))
 
     @commands.command(name="stafftop")
     async def stafftop(self, ctx):
         rows = await all_("SELECT * FROM staff WHERE guild_id=? ORDER BY points DESC LIMIT 10", (ctx.guild.id,))
-        if not rows: return await ctx.send(embed=inf("No data yet."))
+        if not rows:
+            return await ctx.send(embed=inf("No data yet."))
         medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 7
         await ctx.send(embed=pnl("🏆 Leaderboard",
             "\n".join(f"{medals[i]} <@{r['user_id']}> — `{r['points']}` pts" for i, r in enumerate(rows))))
@@ -1340,13 +1581,45 @@ class Prefix(commands.Cog):
     async def help_(self, ctx):
         e = pnl("📖 Command Reference", f"Prefix: `{PREFIX}` — slash commands also available.", DEFAULT)
         e.add_field(name="🛡️ Moderation", value="`ban` `unban` `kick` `softban` `timeout` `untimeout` `warn` `warnings` `delwarn` `purge` `slowmode` `lock` `unlock` `nick` `addrole` `removerole`")
-        e.add_field(name="🤖 Automod", value="`automod` `blockword` `unblockword` `blockedwords` `blockpunish`")
+        e.add_field(name="🤖 Automod", value="`automod` `blockword` `unblockword` `blockedwords` `blockpunish` `automodignore`")
         e.add_field(name="🚨 Anti-Raid", value="`antiraid` `raidmode`")
         e.add_field(name="👋 Welcomer", value="`welcome` `goodbye`")
         e.add_field(name="🔐 Verification", value="`verify` `verify enable` `verify disable` `verify alts` `whois`")
         e.add_field(name="🛡️ Staff", value="`staffsetup` `signin` `signout` `rankadd` `ranks` `promote` `demote` `points` `staffstats` `stafftop`")
         e.add_field(name="📋 Logs", value="`logs`")
         await ctx.send(embed=e)
+
+
+# ─────────────────────────── core ───────────────────────────
+
+class Core(commands.Cog):
+    def __init__(self, bot): self.bot = bot
+
+    @app_commands.command(name="setup", description="Setup checklist")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def setup(self, it):
+        s = await settings(it.guild.id)
+        t = lambda v: "✅" if v else "⬜"
+        await it.response.send_message(ephemeral=True, embed=pnl("🧭 Setup Checklist", "\n".join([
+            f"{t(s['log_channel'])} `/logs` — log channel",
+            f"{t(s['welcome_channel'])} `/welcome` — welcomer",
+            f"{t(s['verify_enabled'])} `/verify enable` — verification",
+            f"{t(s['signin_channel'])} `/staff_setup` — staff sign-in",
+            f"{t(await one('SELECT 1 FROM staff_ranks WHERE guild_id=?', (it.guild.id,)))} `/rank_add` — promotion ladder",
+            f"{t(s['antiraid_enabled'])} `/antiraid` — raid protection",
+        ])))
+
+    @app_commands.command(name="help", description="List all commands")
+    async def help_(self, it):
+        e = pnl("📖 Command Reference", "Every command replies with an embed. Prefix commands exist too.", DEFAULT)
+        e.add_field(name="🛡️ Moderation", value="`ban` `unban` `kick` `softban` `timeout` `untimeout` `warn` `warnings` `delwarn` `purge` `slowmode` `lock` `unlock` `nick` `addrole` `removerole`")
+        e.add_field(name="🤖 Automod", value="`automod` `blockword` `unblockword` `blockedwords` `blockword_punish` `automod_ignore` `automod_unignore`")
+        e.add_field(name="🚨 Anti-Raid", value="`antiraid` `raidmode`")
+        e.add_field(name="👋 Welcomer", value="`welcome` `goodbye` `welcome_preview`")
+        e.add_field(name="🔐 Verification", value="`verify enable` `verify disable` `verify status` `verify alts` `verify whois`")
+        e.add_field(name="📋 Logs", value="`logs`")
+        e.add_field(name="🛡️ Staff", value="`staff_setup` `staff` `rank_add` `ranks` `rank_remove` `promote` `demote` `points` `staffstats` `stafftop`")
+        await it.response.send_message(embed=e, ephemeral=True)
 
 
 # ─────────────────────────── website ───────────────────────────
@@ -1365,6 +1638,7 @@ p{color:#a2a6b3;margin:0 0 20px}a.btn{display:inline-block;padding:12px 26px;bor
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 signer = URLSafeTimedSerializer(SECRET_KEY)
+_recent_attempts: dict[int, float] = {}
 
 
 def page(title, body, emoji="🔐", extra=""):
@@ -1419,7 +1693,8 @@ def callback():
         log.warning("token exchange failed: %s", tok.text[:300])
         return page("Authorization Failed", "Discord rejected the code. Try again.", "❌"), 400
 
-    me = requests.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {tok.json()['access_token']}"}, timeout=15)
+    me = requests.get(f"{API}/users/@me",
+                      headers={"Authorization": f"Bearer {tok.json()['access_token']}"}, timeout=15)
     if me.status_code != 200:
         return page("Profile Error", "Could not read your Discord profile.", "❌"), 400
     user = me.json()
@@ -1442,23 +1717,30 @@ async def handle(gid: int, user: dict, ip: str, ua: str):
     guild = bot.get_guild(gid)
     if guild is None:
         return False, "The bot isn't in that server anymore."
-    s = await settings(gid)          # creates the row if missing — this was the bug
+
+    s = await settings(gid)
     if not s["verify_enabled"]:
         return False, "Verification isn't enabled in that server."
+
     if await one("SELECT 1 FROM verifications WHERE guild_id=? AND user_id=?", (gid, user["id"])):
         return True, "already"
 
-    now = datetime.now(timezone.utc).isoformat()
-    await ex("INSERT INTO verifications (guild_id,user_id,ip,user_agent,verified_at) VALUES (?,?,?,?,?)",
-             (gid, user["id"], ip, ua, now))
-
-    alts = await all_("SELECT user_id FROM verifications WHERE guild_id=? AND ip=? AND user_id!=?", (gid, ip, user["id"]))
-    for a in alts:
-        await ex("INSERT INTO alts (guild_id,user_id,matched_user_id,reason,created_at) VALUES (?,?,?,?,?)",
-                 (gid, user["id"], a["user_id"], f"same IP ({ip})", now))
-
+    now = datetime.now(timezone.utc)
     try:
         member = guild.get_member(user["id"]) or await guild.fetch_member(user["id"])
+    except discord.NotFound:
+        return False, "You need to join the server before verifying."
+
+    await ex("INSERT INTO verifications (guild_id,user_id,ip,user_agent,verified_at) VALUES (?,?,?,?,?)",
+             (gid, user["id"], ip, ua, now.isoformat()))
+
+    alts = await all_("SELECT user_id FROM verifications WHERE guild_id=? AND ip=? AND user_id!=?",
+                      (gid, ip, user["id"]))
+    for a in alts:
+        await ex("INSERT INTO alts (guild_id,user_id,matched_user_id,reason,created_at) VALUES (?,?,?,?,?)",
+                 (gid, user["id"], a["user_id"], f"same IP ({ip})", now.isoformat()))
+
+    try:
         if s["verify_role"] and (role := guild.get_role(s["verify_role"])):
             await member.add_roles(role, reason="Verification")
         if s["unverified_role"] and (role := guild.get_role(s["unverified_role"])) and role in member.roles:
@@ -1468,7 +1750,7 @@ async def handle(gid: int, user: dict, ip: str, ua: str):
 
     if s["verify_log"] and (ch := guild.get_channel(s["verify_log"])):
         created = datetime.fromtimestamp(((int(user["id"]) >> 22) + 1420070400000) / 1000, tz=timezone.utc)
-        age = (datetime.now(timezone.utc) - created).days
+        age = (now - created).days
         avatar = (f"https://cdn.discordapp.com/avatars/{user['id']}/{user['avatar']}.png"
                   if user.get("avatar") else "https://cdn.discordapp.com/embed/avatars/0.png")
         e = pnl("🔐 Member Verified", f"<@{user['id']}> verified.", SUCCESS)
@@ -1476,11 +1758,14 @@ async def handle(gid: int, user: dict, ip: str, ua: str):
         e.add_field(name="Account age", value=f"`{age}d`", inline=True)
         if alts:
             e.add_field(name="Possible alts", value="\n".join(f"<@{a['user_id']}>" for a in alts[:10]), inline=False)
+        if age < 7:
+            e.add_field(name="⚠️ Note", value="Account younger than 7 days.", inline=False)
         e.set_thumbnail(url=avatar)
         try:
             await ch.send(embed=e)
         except discord.HTTPException:
             pass
+
     return True, "ok"
 
 
@@ -1496,8 +1781,22 @@ def keep_alive():
             pass
 
 
+# ─────────────────────────── entrypoint ───────────────────────────
+
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True), daemon=True).start()
+    missing = [k for k in ("TOKEN", "CLIENT_ID", "CLIENT_SECRET", "SECRET_KEY", "WEB_URL", "REDIRECT_URI")
+               if not os.getenv(k)]
+    if missing:
+        log.error("Missing environment variables: %s", ", ".join(missing))
+        raise SystemExit(1)
+
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True),
+                     daemon=True).start()
     log.info("Web server bound to :%s", PORT)
     threading.Thread(target=keep_alive, daemon=True).start()
-    bot.run(TOKEN, log_handler=None)
+
+    try:
+        bot.run(TOKEN, log_handler=None)
+    except Exception:
+        log.exception("Bot crashed on startup")
+        raise SystemExit(1)
